@@ -8,84 +8,71 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 3600
 
-    env:
-      RD_SERVER_IP: ${{ secrets.RD_SERVER_IP }}
-      RD_RENDEZVOUS_PORT: ${{ secrets.RD_RENDEZVOUS_PORT }}
-      RD_RELAY_PORT: ${{ secrets.RD_RELAY_PORT }}
-      RD_PASSWORD: ${{ secrets.RD_PASSWORD }}
-
     steps:
-      - name: Show OS Info
+
+      - name: Show Windows Info
         run: |
-          echo "Running on:"
+          echo "Windows Version:"
           systeminfo | findstr /B /C:"OS Name" /C:"OS Version"
 
-      - name: Download RustDesk (Portable)
+      - name: Download RustDesk
         run: |
-          $url = "https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk.exe"
-          Invoke-WebRequest -Uri $url -OutFile "C:\rustdesk.exe"
+          Invoke-WebRequest `
+            -Uri "https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk.exe" `
+            -OutFile "C:\rustdesk.exe"
 
-      - name: Configure RustDesk to use Your Private Server
+      - name: Create RustDesk Config Directory
         run: |
-          $configPath = "C:\ProgramData\RustDesk\config"
-          New-Item -ItemType Directory -Force -Path $configPath
+          New-Item -ItemType Directory -Force -Path "C:\ProgramData\RustDesk\config"
 
-          $serverConfig = @"
+      - name: Configure Private RustDesk Server
+        run: |
+          $config = @"
 {
-  "id_server": "$env:RD_SERVER_IP",
-  "relay_server": "$env:RD_SERVER_IP",
-  "key": "",
-  "relay_port": $env:RD_RELAY_PORT,
-  "api_server": "$env:RD_SERVER_IP",
+  "id_server": "${{ secrets.RD_SERVER_IP }}",
+  "relay_server": "${{ secrets.RD_SERVER_IP }}",
+  "api_server": "${{ secrets.RD_SERVER_IP }}",
   "api_port": 21114,
-  "rustdesk_version": "pro",
-  "custom_rendezvous_server": "$env:RD_SERVER_IP:$env:RD_RENDEZVOUS_PORT"
+  "relay_port": ${{ secrets.RD_RELAY_PORT }},
+  "custom_rendezvous_server": "${{ secrets.RD_SERVER_IP }}:${{ secrets.RD_RENDEZVOUS_PORT }}"
 }
 "@
 
-          $serverConfig | Out-File "$configPath\config.json" -Encoding UTF8
+          $config | Out-File "C:\ProgramData\RustDesk\config\config.json" -Encoding UTF8
 
-          Write-Host "Custom RustDesk Server Applied:"
-          Get-Content "$configPath\config.json"
-
-      - name: Generate Secure Random Password
+      - name: Generate Password
         run: |
-          $pw = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 16 | % {[char]$_})
-          echo "RD_PASSWORD=$pw" >> $env:GITHUB_ENV
+          $pw = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 12 | % {[char]$_})
           Set-Content -Path "C:\ProgramData\RustDesk\config\password.txt" -Value $pw
-          Write-Host "Generated Password: $pw"
+          echo "RD_PASSWORD=$pw" >> $env:GITHUB_ENV
+          Write-Host "Password Generated: $pw"
 
-      - name: Start RustDesk Service (pro mode)
+      - name: Start RustDesk Service
         run: |
           Start-Process "C:\rustdesk.exe" -ArgumentList "--service install" -Wait
           Start-Process "C:\rustdesk.exe" -ArgumentList "--service start" -Wait
-          Start-Sleep -Seconds 6
+          Start-Sleep -Seconds 5
 
-      - name: Get RustDesk PRO ID
+      - name: Read RustDesk ID
         run: |
-          $pubKeyPath = "C:\ProgramData\RustDesk\config\id_ed25519.pub"
-
           Start-Sleep -Seconds 4
-
-          $id = Get-Content $pubKeyPath
+          $idFile = "C:\ProgramData\RustDesk\config\id_ed25519.pub"
+          $id = Get-Content $idFile
           echo "RD_ID=$id" >> $env:GITHUB_ENV
 
-          Write-Host "===== RUSTDESK PRO LOGIN ====="
+          Write-Host "===== RUSTDESK PRO CONNECTION ====="
           Write-Host "ID:"
           Write-Host $id
           Write-Host "Password: $env:RD_PASSWORD"
-          Write-Host "==============================="
+          Write-Host "==================================="
 
-      - name: KEEP SESSION ALIVE
+      - name: Keep Alive
         run: |
-          Write-Host "Your PRO Remote Desktop is READY!"
-          Write-Host "Use your private RustDesk server for max speed."
-          Write-Host "==============================================="
-          Write-Host "ID: $env:RD_ID"
+          Write-Host "===== Remote Desktop Ready ====="
+          Write-Host "RustDesk ID: $env:RD_ID"
           Write-Host "Password: $env:RD_PASSWORD"
-          Write-Host "==============================================="
-
-          while($true) {
-            Write-Host "[$(Get-Date)] PRO Remote Desktop Active..."
+          Write-Host "================================"
+          while ($true) {
+            Write-Host "[$(Get-Date)] Desktop Active..."
             Start-Sleep -Seconds 300
           }
