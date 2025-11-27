@@ -1,93 +1,188 @@
-name: RDP
+name: Force RDP (sequential cluster attempts)
 
 on:
   workflow_dispatch:
+    inputs:
+      attempt_timeout_minutes:
+        description: 'Timeout per attempt (minutes)'
+        required: false
+        default: '10'
 
 jobs:
-  secure-rdp:
-    runs-on: windows-2022
-    timeout-minutes: 3600
+  attempts:
+    # try multiple runner types in order (sequential: max-parallel: 1)
+    strategy:
+      matrix:
+        runner_type: [windows-2022, windows-2019, windows-latest]
+      max-parallel: 1
+
+    runs-on: ${{ matrix.runner_type }}
+    timeout-minutes: ${{ inputs.attempt_timeout_minutes }}
+
+    env:
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
     steps:
-      - name: Enable RDP + Disable NLA Safely
-        run: |
-          # Enable RDP
-          REG ADD "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f
+      - name: Checkout (for logging)
+        uses: actions/checkout@v4
 
-          # Disable NLA (safe way)
+      - name: Show runner info (diagnostics)
+        run: |
+          Write-Host "=== RUNNER DIAGNOSTICS ==="
+          Write-Host "Matrix runner_type: ${{ matrix.runner_type }}"
+          Write-Host "GITHUB_RUN_ID: $env:GITHUB_RUN_ID"
+          Get-CimInstance Win32_OperatingSystem | Select Caption, Version, BuildNumber | Format-List
+          Write-Host "Time (UTC): $(Get-Date -Format u)"
+          Write-Host "==========================="
+
+      - name: Enable RDP safely (no force restart)
+        run: |
+          Write-Host "Enabling RDP via registry..."
+          REG ADD "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f
           REG ADD "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /t REG_DWORD /d 0 /f
           REG ADD "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /t REG_DWORD /d 0 /f
 
-          # Firewall rule
-          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          # Add simple firewall rule (do not try to delete old - avoid kernel-level race)
+          netsh advfirewall firewall add rule name="RDP-For-GH" dir=in action=allow protocol=TCP localport=3389
 
-      - name: Create RDP User
+      - name: Create RDP local user & initialize profile
         run: |
           Add-Type -AssemblyName System.Security
-
           $chars = ([char[]](33..126)) | Where-Object {$_ -notmatch "\s"}
           $password = -join (Get-Random -InputObject $chars -Count 16)
-
           $secure = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires
 
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires -PasswordNeverExpires
+          } else {
+            Write-Host "User RDP already exists; resetting password."
+            $u = Get-LocalUser -Name "RDP"
+            $u | Set-LocalUser -Password $secure
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
 
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-          # Initialize user session to avoid profile issues
-          runas /user:RDP "cmd.exe /c exit"
+          # quick initialization (spawn and exit a process as that user)
+          $pw = ConvertTo-SecureString $password -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential("RDP",$pw)
+          Start-Process -FilePath "cmd.exe" -Credential $cred -ArgumentList "/c","exit" -WindowStyle Hidden -ErrorAction SilentlyContinue
 
-      - name: Install Tailscale
+      - name: Install Tailscale (stable)
         run: |
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $out = "$env:TEMP\ts.msi"
-          Invoke-WebRequest $url -OutFile $out
-          Start-Process msiexec.exe -ArgumentList "/i `"$out`" /quiet /norestart" -Wait
-          Remove-Item $out
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
 
-      - name: Start Tailscale
+      - name: Start Tailscale and wait for IP
         run: |
-          # Unique hostname to avoid ghost nodes
           $hn = "rdp-" + (Get-Random -Minimum 100000 -Maximum 999999)
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hn
+          Write-Host "Bringing up tailscale with hostname $hn"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$hn
 
-          # Get IP
-          $ip = ""
-          for ($i=0; $i -lt 20; $i++) {
+          $ip=""
+          $tries=0
+          while (-not $ip -and $tries -lt 20) {
             $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
             if ($ip) { break }
             Start-Sleep -Seconds 3
+            $tries++
           }
 
           if (-not $ip) {
-            Write-Error "No Tailscale IP assigned."
-            exit 1
+            Write-Host "No tailscale IP assigned after wait."
+            exit 2
           }
 
+          Write-Host "TAILSCALE_IP=$ip"
           echo "TS_IP=$ip" >> $env:GITHUB_ENV
 
-      - name: Test RDP Port
+      - name: Local verification: TermService + Port listening
+        id: verify_local
         run: |
-          Write-Host "Tailscale IP: $env:TS_IP"
-          $t = Test-NetConnection -ComputerName $env:TS_IP -Port 3389
-          if (-not $t.TcpTestSucceeded) {
-            Write-Error "Port 3389 unreachable."
-            exit 1
+          Write-Host "`n=== Local RDP status check ==="
+          $svc = Get-Service -Name TermService -ErrorAction SilentlyContinue
+          if (-not $svc) {
+            Write-Host "TermService not present."
+          } else {
+            Write-Host "TermService Status: $($svc.Status)"
           }
-          Write-Host "RDP Port is OPEN."
 
-      - name: KEEP ALIVE
+          # is any process listening on 3389?
+          $listening = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          if ($listening) {
+            Write-Host "Port 3389 is LISTENING (local). Success candidate."
+            echo "LISTENING=true" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "Port 3389 is NOT listening locally."
+            echo "LISTENING=false" >> $env:GITHUB_ENV
+          }
+
+          # Additional check: netstat
+          netstat -ano | Select-String ":3389" -SimpleMatch | ForEach-Object { Write-Host $_ }
+          Write-Host "=============================="
+
+      - name: Attempt remote connectivity from runner (best-effort)
         run: |
-          Write-Host "===== RDP INFORMATION ====="
-          Write-Host "IP Address: $env:TS_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "==========================="
+          Write-Host "Testing local connectivity to TS_IP ($env:TS_IP) from runner..."
+          if (-not $env:TS_IP) { Write-Error "No TS_IP found"; exit 2 }
+          $t = Test-NetConnection -ComputerName $env:TS_IP -Port 3389 -InformationLevel Detailed
+          Write-Host $t | Out-String
+          if ($t.TcpTestSucceeded) {
+            Write-Host "Runner sees TCP port reachable."
+            echo "RUNNER_TCP_OK=true" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "Runner sees TCP port NOT reachable."
+            echo "RUNNER_TCP_OK=false" >> $env:GITHUB_ENV
+          }
 
-          # keep runner alive
+      - name: Decide success / fail and either KEEP ALIVE or exit (uses local checks)
+        run: |
+          # We use local TermService + local listening as the ground truth for "RDP actually enabled"
+          $listening = $env:LISTENING
+          $svc = (Get-Service -Name TermService -ErrorAction SilentlyContinue).Status
+
+          Write-Host "Local LISTENING: $listening"
+          Write-Host "TermService status: $svc"
+
+          if ($listening -eq "true" -and $svc -eq "Running") {
+            Write-Host "=== RDP VERIFIED LOCALLY — THIS RUN WILL KEEP ALIVE ==="
+            echo "ATTEM_RESULT=success" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "RDP not usable on this runner. Failing this attempt so next runner variant will be tried."
+            echo "ATTEM_RESULT=failed" >> $env:GITHUB_ENV
+            exit 3
+          }
+
+      - name: Save connection info (artifact + output)
+        if: env.ATTEM_RESULT == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-connection-info-${{ matrix.runner_type }}
+          path: |
+            connection-info.txt
+
+        run: |
+          "TS_IP=$env:TS_IP" | Out-File connection-info.txt -Encoding utf8
+          "USERNAME=RDP" | Out-File connection-info.txt -Append -Encoding utf8
+          "PASSWORD=$env:RDP_PASSWORD" | Out-File connection-info.txt -Append -Encoding utf8
+          "RUNNER_TYPE=${{ matrix.runner_type }}" | Out-File connection-info.txt -Append -Encoding utf8
+          Write-Host "Connection info written to artifact."
+
+      - name: KEEP ALIVE (successful run only)
+        if: env.ATTEM_RESULT == 'success'
+        run: |
+          Write-Host "===== RDP READY ====="
+          Write-Host "IP: $env:TS_IP"
+          Write-Host "User: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host("=====================")
           while ($true) {
-            Write-Host "[$(Get-Date)] RDP Running..."
+            Write-Host "[$(Get-Date)] RDP RUNNER ALIVE - cancel the workflow to terminate"
             Start-Sleep -Seconds 300
           }
+
