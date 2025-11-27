@@ -1,78 +1,48 @@
-name: RustDesk PRO Remote Desktop
+name: RustDesk Remote Desktop
 
 on:
   workflow_dispatch:
 
 jobs:
-  pro-remote:
+  desktop:
     runs-on: windows-latest
     timeout-minutes: 3600
 
     steps:
 
-      - name: Show Windows Info
-        run: |
-          echo "Windows Version:"
-          systeminfo | findstr /B /C:"OS Name" /C:"OS Version"
-
       - name: Download RustDesk
         run: |
-          Invoke-WebRequest `
-            -Uri "https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk.exe" `
-            -OutFile "C:\rustdesk.exe"
+          Invoke-WebRequest -Uri "https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk.exe" -OutFile "C:\rustdesk.exe"
 
-      - name: Create RustDesk Config Directory
+      - name: Create Config Folder
         run: |
           New-Item -ItemType Directory -Force -Path "C:\ProgramData\RustDesk\config"
 
-      - name: Configure Private RustDesk Server
-        run: |
-          $config = @"
-{
-  "id_server": "${{ secrets.RD_SERVER_IP }}",
-  "relay_server": "${{ secrets.RD_SERVER_IP }}",
-  "api_server": "${{ secrets.RD_SERVER_IP }}",
-  "api_port": 21114,
-  "relay_port": ${{ secrets.RD_RELAY_PORT }},
-  "custom_rendezvous_server": "${{ secrets.RD_SERVER_IP }}:${{ secrets.RD_RENDEZVOUS_PORT }}"
-}
-"@
-
-          $config | Out-File "C:\ProgramData\RustDesk\config\config.json" -Encoding UTF8
-
-      - name: Generate Password
+      - name: Set Password
         run: |
           $pw = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 12 | % {[char]$_})
           Set-Content -Path "C:\ProgramData\RustDesk\config\password.txt" -Value $pw
-          echo "RD_PASSWORD=$pw" >> $env:GITHUB_ENV
-          Write-Host "Password Generated: $pw"
+          echo "PASSWORD=$pw" >> $env:GITHUB_ENV
 
       - name: Start RustDesk Service
         run: |
           Start-Process "C:\rustdesk.exe" -ArgumentList "--service install" -Wait
           Start-Process "C:\rustdesk.exe" -ArgumentList "--service start" -Wait
-          Start-Sleep -Seconds 5
+          Start-Sleep -Seconds 4
 
-      - name: Read RustDesk ID
+      - name: Get RustDesk ID
         run: |
           Start-Sleep -Seconds 4
-          $idFile = "C:\ProgramData\RustDesk\config\id_ed25519.pub"
-          $id = Get-Content $idFile
-          echo "RD_ID=$id" >> $env:GITHUB_ENV
-
-          Write-Host "===== RUSTDESK PRO CONNECTION ====="
-          Write-Host "ID:"
-          Write-Host $id
-          Write-Host "Password: $env:RD_PASSWORD"
-          Write-Host "==================================="
+          $id = Get-Content "C:\ProgramData\RustDesk\config\id_ed25519.pub"
+          echo "ID=$id" >> $env:GITHUB_ENV
+          Write-Host "RustDesk ID: $id"
+          Write-Host "Password: $env:PASSWORD"
 
       - name: Keep Alive
         run: |
-          Write-Host "===== Remote Desktop Ready ====="
-          Write-Host "RustDesk ID: $env:RD_ID"
-          Write-Host "Password: $env:RD_PASSWORD"
-          Write-Host "================================"
+          Write-Host "Connect via RustDesk"
+          Write-Host "ID: $env:ID"
+          Write-Host "Password: $env:PASSWORD"
           while ($true) {
-            Write-Host "[$(Get-Date)] Desktop Active..."
             Start-Sleep -Seconds 300
           }
